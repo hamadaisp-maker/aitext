@@ -168,7 +168,7 @@ export default function VideoUploader() {
       const base64Data = arrayBufferToBase64(audioArrayBuffer);
       console.log(`[Step 3] Base64 size: ${(base64Data.length / 1024 / 1024).toFixed(2)}MB`);
 
-      const model = "gemini-2.0-flash";
+      const model = "gemini-3-pro-preview";
       const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
 
       setStatus("Gemini が文字起こし中...");
