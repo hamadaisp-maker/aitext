@@ -80,7 +80,7 @@ export default function VideoUploader() {
     apiKey: string,
     file: File
   ): Promise<string> {
-    const model = "gemini-2.0-flash";
+    const model = "gemini-2.5-flash";
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
 
     console.log("[transcribe] File type:", file.type, "File name:", file.name);
@@ -140,6 +140,9 @@ export default function VideoUploader() {
         ],
         generationConfig: {
           maxOutputTokens: 65536,
+          thinkingConfig: {
+            thinkingBudget: 0,
+          },
         },
       }),
     });
