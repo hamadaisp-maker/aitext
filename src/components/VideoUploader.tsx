@@ -83,6 +83,32 @@ export default function VideoUploader() {
     const model = "gemini-2.0-flash";
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
 
+    console.log("[transcribe] File type:", file.type, "File name:", file.name);
+
+    // MIMEタイプをGemini対応形式にマッピング
+    const mimeMap: Record<string, string> = {
+      "video/mp4": "video/mp4",
+      "video/mpeg": "video/mpeg",
+      "video/mov": "video/mov",
+      "video/quicktime": "video/mov",
+      "video/avi": "video/avi",
+      "video/x-msvideo": "video/avi",
+      "video/x-flv": "video/x-flv",
+      "video/mpg": "video/mpg",
+      "video/webm": "video/webm",
+      "video/wmv": "video/wmv",
+      "video/3gpp": "video/3gpp",
+      "audio/mpeg": "audio/mpeg",
+      "audio/mp3": "audio/mp3",
+      "audio/wav": "audio/wav",
+      "audio/aac": "audio/aac",
+      "audio/ogg": "audio/ogg",
+      "audio/flac": "audio/flac",
+      "audio/webm": "audio/webm",
+    };
+    const mimeType = mimeMap[file.type] || file.type;
+    console.log("[transcribe] Using MIME type:", mimeType);
+
     console.log("[transcribe] Converting file to base64...");
     const arrayBuffer = await file.arrayBuffer();
     const base64Data = arrayBufferToBase64(arrayBuffer);
@@ -102,7 +128,7 @@ export default function VideoUploader() {
             parts: [
               {
                 inline_data: {
-                  mime_type: file.type,
+                  mime_type: mimeType,
                   data: base64Data,
                 },
               },
