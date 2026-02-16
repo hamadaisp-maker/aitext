@@ -2,6 +2,14 @@
 
 import { useState, useRef, useCallback } from "react";
 
+const PROMPT =
+  "この音声/動画を文字起こししてください。以下のルールに従ってください：\n" +
+  "- タイムスタンプは不要\n" +
+  "- 話者の区別は不要\n" +
+  "- 「あー」「えー」「まあ」「えっと」などのフィラー（つなぎ言葉）はすべて省いてください\n" +
+  "- 内容を省略せず、すべての発言を書き起こしてください\n" +
+  "- 整った読みやすい文章として出力してください";
+
 export default function VideoUploader() {
   const [file, setFile] = useState<File | null>(null);
   const [transcription, setTranscription] = useState<string>("");
@@ -45,13 +53,16 @@ export default function VideoUploader() {
     setIsDragOver(false);
   }, []);
 
-  // Gemini File APIにクライアントから直接アップロード
-  async function uploadToGemini(
-    apiKey: string,
-    file: File
-  ): Promise<string> {
-    setStatus("ファイルをアップロード中...");
+  // APIキーをサーバーから取得
+  async function getApiKey(): Promise<string> {
+    const res = await fetch("/api/upload", { method: "POST" });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error);
+    return data.apiKey;
+  }
 
+  // Gemini File APIにアップロード
+  async function uploadToGemini(apiKey: string, file: File): Promise<string> {
     // Step 1: Resumable upload を開始
     const startRes = await fetch(
       `https://generativelanguage.googleapis.com/upload/v1beta/files?key=${apiKey}`,
@@ -97,42 +108,104 @@ export default function VideoUploader() {
     return fileUri;
   }
 
+  // ファイルがACTIVEになるまで待つ
+  async function waitForFileActive(
+    apiKey: string,
+    fileUri: string
+  ): Promise<void> {
+    const fileName = fileUri.split("/").pop();
+    const maxAttempts = 120;
+
+    for (let i = 0; i < maxAttempts; i++) {
+      const res = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/files/${fileName}?key=${apiKey}`
+      );
+      const data = await res.json();
+
+      if (data.state === "ACTIVE") {
+        return;
+      } else if (data.state === "FAILED") {
+        throw new Error("ファイルの処理に失敗しました。");
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, 3000));
+    }
+
+    throw new Error("ファイルの処理がタイムアウトしました。");
+  }
+
+  // Geminiで文字起こし
+  async function transcribeWithGemini(
+    apiKey: string,
+    fileUri: string,
+    mimeType: string
+  ): Promise<string> {
+    const model = "gemini-2.5-flash";
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [
+          {
+            parts: [
+              {
+                fileData: {
+                  mimeType: mimeType,
+                  fileUri: fileUri,
+                },
+              },
+              {
+                text: PROMPT,
+              },
+            ],
+          },
+        ],
+        generationConfig: {
+          maxOutputTokens: 65536,
+        },
+      }),
+    });
+
+    const data = await res.json();
+
+    if (!res.ok) {
+      console.error("Gemini error:", JSON.stringify(data, null, 2));
+      throw new Error(data.error?.message || "文字起こしに失敗しました。");
+    }
+
+    return (
+      data.candidates?.[0]?.content?.parts?.[0]?.text ??
+      "文字起こし結果を取得できませんでした。"
+    );
+  }
+
   const handleSubmit = async () => {
     if (!file) return;
 
     setIsLoading(true);
     setError("");
     setTranscription("");
-    setStatus("準備中...");
 
     try {
-      // Step 1: サーバーからAPIキーを取得
+      // Step 1: APIキー取得
       setStatus("認証情報を取得中...");
-      const authRes = await fetch("/api/upload", { method: "POST" });
-      const authData = await authRes.json();
-      if (!authRes.ok) throw new Error(authData.error);
+      const apiKey = await getApiKey();
 
-      // Step 2: クライアントから直接Gemini File APIにアップロード
-      const fileUri = await uploadToGemini(authData.apiKey, file);
+      // Step 2: Gemini File APIにアップロード
+      setStatus("ファイルをアップロード中...");
+      const fileUri = await uploadToGemini(apiKey, file);
 
-      // Step 3: サーバーで文字起こし実行
+      // Step 3: ファイル処理完了を待つ
+      setStatus("ファイルを処理中...");
+      await waitForFileActive(apiKey, fileUri);
+
+      // Step 4: 文字起こし
       setStatus("Gemini が文字起こし中...");
-      const res = await fetch("/api/transcribe", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          fileUri,
-          mimeType: file.type,
-        }),
-      });
+      const text = await transcribeWithGemini(apiKey, fileUri, file.type);
 
-      const data = await res.json();
-
-      if (!res.ok) {
-        throw new Error(data.error || "文字起こしに失敗しました。");
-      }
-
-      setTranscription(data.transcription);
+      setTranscription(text);
       setStatus("");
     } catch (err) {
       setError(
