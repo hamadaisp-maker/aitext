@@ -1,23 +1,7 @@
 "use client";
 
 import { useState, useRef, useCallback } from "react";
-
-const PROMPT =
-  "この音声/動画を文字起こししてください。以下のルールに従ってください：\n" +
-  "- タイムスタンプは不要\n" +
-  "- 話者の区別は不要\n" +
-  "- 「あー」「えー」「まあ」「えっと」などのフィラー（つなぎ言葉）はすべて省いてください\n" +
-  "- 内容を省略せず、すべての発言を書き起こしてください\n" +
-  "- 整った読みやすい文章として出力してください";
-
-function arrayBufferToBase64(buffer: ArrayBuffer): string {
-  const bytes = new Uint8Array(buffer);
-  let binary = "";
-  for (let i = 0; i < bytes.length; i++) {
-    binary += String.fromCharCode(bytes[i]);
-  }
-  return btoa(binary);
-}
+import { GoogleGenAI } from "@google/genai";
 
 export default function VideoUploader() {
   const [file, setFile] = useState<File | null>(null);
@@ -35,11 +19,6 @@ export default function VideoUploader() {
       !selectedFile.type.startsWith("audio/")
     ) {
       setError("動画または音声ファイル（MP4等）を選択してください。");
-      return;
-    }
-    // Gemini inline_data の上限は約20MB
-    if (selectedFile.size > 20 * 1024 * 1024) {
-      setError("ファイルサイズは20MB以下にしてください。");
       return;
     }
     setFile(selectedFile);
@@ -75,94 +54,6 @@ export default function VideoUploader() {
     return data.apiKey;
   }
 
-  // base64で直接Geminiに送信して文字起こし
-  async function transcribe(
-    apiKey: string,
-    file: File
-  ): Promise<string> {
-    const model = "gemini-2.5-flash";
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
-
-    console.log("[transcribe] File type:", file.type, "File name:", file.name);
-
-    // MIMEタイプをGemini対応形式にマッピング
-    const mimeMap: Record<string, string> = {
-      "video/mp4": "video/mp4",
-      "video/mpeg": "video/mpeg",
-      "video/mov": "video/mov",
-      "video/quicktime": "video/mov",
-      "video/avi": "video/avi",
-      "video/x-msvideo": "video/avi",
-      "video/x-flv": "video/x-flv",
-      "video/mpg": "video/mpg",
-      "video/webm": "video/webm",
-      "video/wmv": "video/wmv",
-      "video/3gpp": "video/3gpp",
-      "audio/mpeg": "audio/mpeg",
-      "audio/mp3": "audio/mp3",
-      "audio/wav": "audio/wav",
-      "audio/aac": "audio/aac",
-      "audio/ogg": "audio/ogg",
-      "audio/flac": "audio/flac",
-      "audio/webm": "audio/webm",
-    };
-    const mimeType = mimeMap[file.type] || file.type;
-    console.log("[transcribe] Using MIME type:", mimeType);
-
-    console.log("[transcribe] Converting file to base64...");
-    const arrayBuffer = await file.arrayBuffer();
-    const base64Data = arrayBufferToBase64(arrayBuffer);
-    console.log(`[transcribe] Base64 size: ${(base64Data.length / 1024 / 1024).toFixed(1)}MB`);
-
-    console.log("[transcribe] Sending request to Gemini...");
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 600000); // 10分
-
-    const res = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      signal: controller.signal,
-      body: JSON.stringify({
-        contents: [
-          {
-            parts: [
-              {
-                inline_data: {
-                  mime_type: mimeType,
-                  data: base64Data,
-                },
-              },
-              {
-                text: PROMPT,
-              },
-            ],
-          },
-        ],
-        generationConfig: {
-          maxOutputTokens: 65536,
-          thinkingConfig: {
-            thinkingBudget: 0,
-          },
-        },
-      }),
-    });
-
-    clearTimeout(timeoutId);
-
-    const data = await res.json();
-
-    if (!res.ok) {
-      console.error("Gemini error:", JSON.stringify(data, null, 2));
-      throw new Error(data.error?.message || "文字起こしに失敗しました。");
-    }
-
-    console.log("[transcribe] Success!");
-    return (
-      data.candidates?.[0]?.content?.parts?.[0]?.text ??
-      "文字起こし結果を取得できませんでした。"
-    );
-  }
-
   const handleSubmit = async () => {
     if (!file) return;
 
@@ -177,24 +68,70 @@ export default function VideoUploader() {
       const apiKey = await getApiKey();
       console.log("[Step 1] API key obtained.");
 
-      // Step 2: 文字起こし
-      setStatus("Gemini に送信中...");
-      console.log("[Step 2] Starting transcription...");
-      const text = await transcribe(apiKey, file);
-      console.log("[Step 2] Transcription complete.");
+      // Step 2: SDK経由でGemini File APIにアップロード
+      setStatus("ファイルをアップロード中...");
+      console.log("[Step 2] Uploading via SDK...");
 
-      setTranscription(text);
+      const ai = new GoogleGenAI({ apiKey });
+      const uploadedFile = await ai.files.upload({
+        file: file,
+        config: {
+          mimeType: file.type,
+          displayName: file.name,
+        },
+      });
+
+      console.log("[Step 2] Upload complete. URI:", uploadedFile.uri, "State:", uploadedFile.state);
+
+      // Step 3: ACTIVEになるまでクライアント側で待つ
+      setStatus("ファイルを処理中...");
+      console.log("[Step 3] Waiting for ACTIVE state...");
+
+      let fileState = uploadedFile;
+      let attempts = 0;
+      while (fileState.state === "PROCESSING" && attempts < 60) {
+        attempts++;
+        console.log(`[Step 3] State: ${fileState.state}, attempt ${attempts}...`);
+        setStatus(`ファイルを処理中...（${attempts}回目）`);
+        await new Promise((resolve) => setTimeout(resolve, 5000));
+        fileState = await ai.files.get({ name: fileState.name! });
+      }
+
+      if (fileState.state !== "ACTIVE") {
+        throw new Error(`ファイルの処理に失敗しました (state: ${fileState.state})`);
+      }
+
+      console.log("[Step 3] File is ACTIVE!");
+
+      // Step 4: サーバーに文字起こしを依頼
+      setStatus("Gemini が文字起こし中...");
+      console.log("[Step 4] Requesting transcription...");
+
+      const res = await fetch("/api/transcribe", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          fileUri: fileState.uri,
+          mimeType: fileState.mimeType,
+        }),
+      });
+
+      const data = await res.json();
+
+      if (!res.ok) {
+        throw new Error(data.error || "文字起こしに失敗しました。");
+      }
+
+      console.log("[Step 4] Transcription complete!");
+      setTranscription(data.transcription);
       setStatus("");
     } catch (err) {
-      if (err instanceof Error && err.name === "AbortError") {
-        setError("タイムアウトしました。もう一度お試しください。");
-      } else {
-        setError(
-          err instanceof Error
-            ? err.message
-            : "文字起こし中にエラーが発生しました。"
-        );
-      }
+      console.error("Error:", err);
+      setError(
+        err instanceof Error
+          ? err.message
+          : "文字起こし中にエラーが発生しました。"
+      );
       setStatus("");
     } finally {
       setIsLoading(false);
@@ -286,7 +223,7 @@ export default function VideoUploader() {
               またはクリックしてファイルを選択
             </p>
             <p className="text-xs text-zinc-400">
-              MP4, MOV, AVI, WebM, MP3, WAV 対応（20MBまで）
+              MP4, MOV, AVI, WebM, MP3, WAV 対応
             </p>
           </div>
         )}
