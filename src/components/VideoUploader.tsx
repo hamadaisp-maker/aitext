@@ -6,14 +6,18 @@ export default function VideoUploader() {
   const [file, setFile] = useState<File | null>(null);
   const [transcription, setTranscription] = useState<string>("");
   const [isLoading, setIsLoading] = useState(false);
+  const [status, setStatus] = useState<string>("");
   const [error, setError] = useState<string>("");
   const [isDragOver, setIsDragOver] = useState(false);
   const [copied, setCopied] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const handleFile = useCallback((selectedFile: File) => {
-    if (!selectedFile.type.startsWith("video/")) {
-      setError("動画ファイル（MP4等）を選択してください。");
+    if (
+      !selectedFile.type.startsWith("video/") &&
+      !selectedFile.type.startsWith("audio/")
+    ) {
+      setError("動画または音声ファイル（MP4等）を選択してください。");
       return;
     }
     setFile(selectedFile);
@@ -41,20 +45,85 @@ export default function VideoUploader() {
     setIsDragOver(false);
   }, []);
 
+  // Gemini File APIにクライアントから直接アップロード
+  async function uploadToGemini(
+    apiKey: string,
+    file: File
+  ): Promise<string> {
+    setStatus("ファイルをアップロード中...");
+
+    // Step 1: Resumable upload を開始
+    const startRes = await fetch(
+      `https://generativelanguage.googleapis.com/upload/v1beta/files?key=${apiKey}`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Goog-Upload-Protocol": "resumable",
+          "X-Goog-Upload-Command": "start",
+          "X-Goog-Upload-Header-Content-Length": String(file.size),
+          "X-Goog-Upload-Header-Content-Type": file.type,
+        },
+        body: JSON.stringify({
+          file: { displayName: file.name },
+        }),
+      }
+    );
+
+    const uploadUrl = startRes.headers.get("X-Goog-Upload-URL");
+    if (!uploadUrl) {
+      throw new Error("アップロードURLの取得に失敗しました。");
+    }
+
+    // Step 2: ファイルデータをアップロード
+    const arrayBuffer = await file.arrayBuffer();
+    const uploadRes = await fetch(uploadUrl, {
+      method: "POST",
+      headers: {
+        "Content-Length": String(file.size),
+        "X-Goog-Upload-Offset": "0",
+        "X-Goog-Upload-Command": "upload, finalize",
+      },
+      body: arrayBuffer,
+    });
+
+    const uploadData = await uploadRes.json();
+    const fileUri = uploadData?.file?.uri;
+
+    if (!fileUri) {
+      throw new Error("ファイルのアップロードに失敗しました。");
+    }
+
+    return fileUri;
+  }
+
   const handleSubmit = async () => {
     if (!file) return;
 
     setIsLoading(true);
     setError("");
     setTranscription("");
+    setStatus("準備中...");
 
     try {
-      const formData = new FormData();
-      formData.append("video", file);
+      // Step 1: サーバーからAPIキーを取得
+      setStatus("認証情報を取得中...");
+      const authRes = await fetch("/api/upload", { method: "POST" });
+      const authData = await authRes.json();
+      if (!authRes.ok) throw new Error(authData.error);
 
+      // Step 2: クライアントから直接Gemini File APIにアップロード
+      const fileUri = await uploadToGemini(authData.apiKey, file);
+
+      // Step 3: サーバーで文字起こし実行
+      setStatus("Gemini が文字起こし中...");
       const res = await fetch("/api/transcribe", {
         method: "POST",
-        body: formData,
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          fileUri,
+          mimeType: file.type,
+        }),
       });
 
       const data = await res.json();
@@ -64,10 +133,14 @@ export default function VideoUploader() {
       }
 
       setTranscription(data.transcription);
+      setStatus("");
     } catch (err) {
       setError(
-        err instanceof Error ? err.message : "文字起こし中にエラーが発生しました。"
+        err instanceof Error
+          ? err.message
+          : "文字起こし中にエラーが発生しました。"
       );
+      setStatus("");
     } finally {
       setIsLoading(false);
     }
@@ -80,8 +153,12 @@ export default function VideoUploader() {
   };
 
   const handleDownload = () => {
-    const baseName = file ? file.name.replace(/\.[^.]+$/, "") : "transcription";
-    const blob = new Blob([transcription], { type: "text/plain;charset=utf-8" });
+    const baseName = file
+      ? file.name.replace(/\.[^.]+$/, "")
+      : "transcription";
+    const blob = new Blob([transcription], {
+      type: "text/plain;charset=utf-8",
+    });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
@@ -94,6 +171,7 @@ export default function VideoUploader() {
     setFile(null);
     setTranscription("");
     setError("");
+    setStatus("");
     if (fileInputRef.current) fileInputRef.current.value = "";
   };
 
@@ -124,7 +202,7 @@ export default function VideoUploader() {
         <input
           ref={fileInputRef}
           type="file"
-          accept="video/*"
+          accept="video/*,audio/*"
           onChange={(e) => {
             const f = e.target.files?.[0];
             if (f) handleFile(f);
@@ -138,9 +216,7 @@ export default function VideoUploader() {
             <p className="font-medium text-zinc-900 dark:text-zinc-100">
               {file.name}
             </p>
-            <p className="text-sm text-zinc-500">
-              {formatFileSize(file.size)}
-            </p>
+            <p className="text-sm text-zinc-500">{formatFileSize(file.size)}</p>
             <p className="text-xs text-zinc-400">
               クリックしてファイルを変更
             </p>
@@ -154,7 +230,9 @@ export default function VideoUploader() {
             <p className="text-sm text-zinc-500">
               またはクリックしてファイルを選択
             </p>
-            <p className="text-xs text-zinc-400">MP4, MOV, AVI, WebM 対応</p>
+            <p className="text-xs text-zinc-400">
+              MP4, MOV, AVI, WebM, MP3, WAV 対応
+            </p>
           </div>
         )}
       </div>
@@ -218,10 +296,12 @@ export default function VideoUploader() {
       )}
 
       {/* Loading Status */}
-      {isLoading && (
+      {isLoading && status && (
         <div className="p-4 rounded-lg bg-blue-50 dark:bg-blue-950/30 border border-blue-200 dark:border-blue-800 text-blue-700 dark:text-blue-400 space-y-2">
-          <p className="font-medium">Gemini が動画を処理しています...</p>
-          <p className="text-sm">動画の長さによって数分〜十数分かかることがあります。長い動画は自動的に分割して処理します。</p>
+          <p className="font-medium">{status}</p>
+          <p className="text-sm">
+            動画の長さによって数分かかることがあります。
+          </p>
         </div>
       )}
 
