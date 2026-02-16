@@ -10,27 +10,55 @@ const PROMPT =
   "- 内容を省略せず、すべての発言を書き起こしてください\n" +
   "- 整った読みやすい文章として出力してください";
 
-// 動画/音声からWAV音声を抽出（ブラウザのWeb Audio APIを使用）
-async function extractAudioAsWav(file: File): Promise<Blob> {
+const PROMPT_CONTINUATION =
+  "この音声は長い音声の続きです。前のパートに続けて文字起こししてください。以下のルールに従ってください：\n" +
+  "- タイムスタンプは不要\n" +
+  "- 話者の区別は不要\n" +
+  "- 「あー」「えー」「まあ」「えっと」などのフィラー（つなぎ言葉）はすべて省いてください\n" +
+  "- 内容を省略せず、すべての発言を書き起こしてください\n" +
+  "- 整った読みやすい文章として出力してください\n" +
+  "- 前のパートとの接続は気にせず、この音声の内容だけを書き起こしてください";
+
+// 1チャンクあたりの秒数（5分）
+const CHUNK_SECONDS = 5 * 60;
+
+// 動画/音声からAudioBufferを取得
+async function decodeAudio(file: File): Promise<AudioBuffer> {
   const arrayBuffer = await file.arrayBuffer();
   const audioContext = new AudioContext({ sampleRate: 16000 });
   const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
 
   // モノラルに変換
-  const numberOfChannels = 1;
-  const length = audioBuffer.length;
-  const sampleRate = 16000;
-  const offlineContext = new OfflineAudioContext(numberOfChannels, length, sampleRate);
+  const offlineContext = new OfflineAudioContext(1, audioBuffer.length, 16000);
   const source = offlineContext.createBufferSource();
   source.buffer = audioBuffer;
   source.connect(offlineContext.destination);
   source.start();
   const renderedBuffer = await offlineContext.startRendering();
-
-  // WAVに変換
-  const wavBuffer = audioBufferToWav(renderedBuffer);
   await audioContext.close();
-  return new Blob([wavBuffer], { type: "audio/wav" });
+  return renderedBuffer;
+}
+
+// AudioBufferを指定範囲でチャンクに分割
+function splitAudioBuffer(buffer: AudioBuffer, chunkSeconds: number): AudioBuffer[] {
+  const sampleRate = buffer.sampleRate;
+  const totalSamples = buffer.length;
+  const chunkSamples = chunkSeconds * sampleRate;
+  const chunks: AudioBuffer[] = [];
+
+  for (let offset = 0; offset < totalSamples; offset += chunkSamples) {
+    const length = Math.min(chunkSamples, totalSamples - offset);
+    const chunkBuffer = new AudioBuffer({
+      numberOfChannels: 1,
+      length: length,
+      sampleRate: sampleRate,
+    });
+    const sourceData = buffer.getChannelData(0).slice(offset, offset + length);
+    chunkBuffer.copyToChannel(sourceData, 0);
+    chunks.push(chunkBuffer);
+  }
+
+  return chunks;
 }
 
 // AudioBufferをWAVバイナリに変換
@@ -63,11 +91,11 @@ function audioBufferToWav(buffer: AudioBuffer): ArrayBuffer {
   view.setUint32(40, dataLength, true);
 
   // PCM data
-  let offset = 44;
+  let writeOffset = 44;
   for (let i = 0; i < samples.length; i++) {
     const s = Math.max(-1, Math.min(1, samples[i]));
-    view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
-    offset += 2;
+    view.setInt16(writeOffset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+    writeOffset += 2;
   }
 
   return arrayBuffer;
@@ -88,6 +116,58 @@ function arrayBufferToBase64(buffer: ArrayBuffer): string {
     binary += String.fromCharCode(...chunk);
   }
   return btoa(binary);
+}
+
+// Geminiに送信して文字起こし
+async function transcribeChunk(
+  apiKey: string,
+  base64Data: string,
+  isFirst: boolean
+): Promise<string> {
+  const model = "gemini-3-pro-preview";
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 600000);
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    signal: controller.signal,
+    body: JSON.stringify({
+      contents: [
+        {
+          parts: [
+            {
+              inline_data: {
+                mime_type: "audio/wav",
+                data: base64Data,
+              },
+            },
+            {
+              text: isFirst ? PROMPT : PROMPT_CONTINUATION,
+            },
+          ],
+        },
+      ],
+      generationConfig: {
+        maxOutputTokens: 65536,
+      },
+    }),
+  });
+
+  clearTimeout(timeoutId);
+  const data = await res.json();
+
+  if (!res.ok) {
+    console.error("Gemini error:", JSON.stringify(data, null, 2));
+    throw new Error(data.error?.message || "文字起こしに失敗しました。");
+  }
+
+  return (
+    data.candidates?.[0]?.content?.parts?.[0]?.text ??
+    "文字起こし結果を取得できませんでした。"
+  );
 }
 
 export default function VideoUploader() {
@@ -157,64 +237,33 @@ export default function VideoUploader() {
 
       // Step 2: 動画から音声を抽出
       setStatus("音声を抽出中...");
-      console.log("[Step 2] Extracting audio from video...");
-      const audioBlob = await extractAudioAsWav(file);
-      console.log(`[Step 2] Audio extracted: ${(audioBlob.size / 1024 / 1024).toFixed(2)}MB`);
+      console.log("[Step 2] Extracting audio...");
+      const audioBuffer = await decodeAudio(file);
+      const totalSeconds = audioBuffer.length / audioBuffer.sampleRate;
+      console.log(`[Step 2] Audio: ${(totalSeconds / 60).toFixed(1)}分, ${audioBuffer.length} samples`);
 
-      // Step 3: base64変換してGeminiに送信
-      setStatus("Gemini に送信中...");
-      console.log("[Step 3] Converting to base64 and sending...");
-      const audioArrayBuffer = await audioBlob.arrayBuffer();
-      const base64Data = arrayBufferToBase64(audioArrayBuffer);
-      console.log(`[Step 3] Base64 size: ${(base64Data.length / 1024 / 1024).toFixed(2)}MB`);
+      // Step 3: チャンクに分割
+      const chunks = splitAudioBuffer(audioBuffer, CHUNK_SECONDS);
+      console.log(`[Step 3] Split into ${chunks.length} chunk(s)`);
 
-      const model = "gemini-3-pro-preview";
-      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+      // Step 4: 各チャンクを文字起こし
+      const results: string[] = [];
+      for (let i = 0; i < chunks.length; i++) {
+        setStatus(`文字起こし中... (${i + 1}/${chunks.length})`);
+        console.log(`[Step 4] Transcribing chunk ${i + 1}/${chunks.length}...`);
 
-      setStatus("Gemini が文字起こし中...");
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 600000);
+        const wavBuffer = audioBufferToWav(chunks[i]);
+        const base64Data = arrayBufferToBase64(wavBuffer);
+        console.log(`[Step 4] Chunk ${i + 1} base64 size: ${(base64Data.length / 1024 / 1024).toFixed(2)}MB`);
 
-      const res = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        signal: controller.signal,
-        body: JSON.stringify({
-          contents: [
-            {
-              parts: [
-                {
-                  inline_data: {
-                    mime_type: "audio/wav",
-                    data: base64Data,
-                  },
-                },
-                {
-                  text: PROMPT,
-                },
-              ],
-            },
-          ],
-          generationConfig: {
-            maxOutputTokens: 65536,
-          },
-        }),
-      });
-
-      clearTimeout(timeoutId);
-      const data = await res.json();
-
-      if (!res.ok) {
-        console.error("Gemini error:", JSON.stringify(data, null, 2));
-        throw new Error(data.error?.message || "文字起こしに失敗しました。");
+        const text = await transcribeChunk(apiKey, base64Data, i === 0);
+        results.push(text);
+        console.log(`[Step 4] Chunk ${i + 1} done.`);
       }
 
-      const text =
-        data.candidates?.[0]?.content?.parts?.[0]?.text ??
-        "文字起こし結果を取得できませんでした。";
-
-      console.log("[Step 3] Transcription complete!");
-      setTranscription(text);
+      const fullText = results.join("\n\n");
+      console.log("[Done] Transcription complete!");
+      setTranscription(fullText);
       setStatus("");
     } catch (err) {
       console.error("Error:", err);
@@ -318,7 +367,7 @@ export default function VideoUploader() {
               またはクリックしてファイルを選択
             </p>
             <p className="text-xs text-zinc-400">
-              MP4, MOV, AVI, WebM, MP3, WAV 対応
+              MP4, MOV, AVI, WebM, MP3, WAV 対応（長時間動画OK）
             </p>
           </div>
         )}
@@ -387,7 +436,7 @@ export default function VideoUploader() {
         <div className="p-4 rounded-lg bg-blue-50 dark:bg-blue-950/30 border border-blue-200 dark:border-blue-800 text-blue-700 dark:text-blue-400 space-y-2">
           <p className="font-medium">{status}</p>
           <p className="text-sm">
-            動画の長さによって1〜3分程度かかります。
+            動画の長さによって数分かかることがあります。長い動画は自動的に分割して処理します。
           </p>
         </div>
       )}
