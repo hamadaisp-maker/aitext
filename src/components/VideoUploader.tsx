@@ -108,11 +108,46 @@ export default function VideoUploader() {
     return fileUri;
   }
 
-  // アップロード後に少し待つ（Geminiがファイルを処理する時間を確保）
-  async function waitForProcessing(): Promise<void> {
-    console.log("[waitForProcessing] Waiting 5 seconds for file processing...");
-    await new Promise((resolve) => setTimeout(resolve, 5000));
-    console.log("[waitForProcessing] Done waiting.");
+  // ファイルがACTIVEになるまで待つ
+  async function waitForFileActive(
+    apiKey: string,
+    fileUri: string
+  ): Promise<void> {
+    const fileName = fileUri.split("/").pop();
+    const maxAttempts = 60;
+
+    for (let i = 0; i < maxAttempts; i++) {
+      console.log(`[waitForFileActive] attempt ${i + 1}...`);
+      try {
+        const res = await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/files/${fileName}?key=${apiKey}`
+        );
+
+        if (res.ok) {
+          const data = await res.json();
+          console.log(`[waitForFileActive] state: ${data.state}`);
+
+          if (data.state === "ACTIVE") {
+            console.log("[waitForFileActive] File is ACTIVE!");
+            return;
+          } else if (data.state === "FAILED") {
+            throw new Error("ファイルの処理に失敗しました。");
+          }
+        } else {
+          // 500エラー等はまだ処理中とみなす
+          console.log(`[waitForFileActive] HTTP ${res.status}, still processing...`);
+        }
+      } catch (err) {
+        if (err instanceof Error && err.message === "ファイルの処理に失敗しました。") {
+          throw err;
+        }
+        console.log("[waitForFileActive] Request failed, retrying...");
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, 5000));
+    }
+
+    throw new Error("ファイルの処理がタイムアウトしました。");
   }
 
   // Geminiで文字起こし
@@ -188,11 +223,11 @@ export default function VideoUploader() {
       const fileUri = await uploadToGemini(apiKey, file);
       console.log("[Step 2] Upload complete. fileUri:", fileUri);
 
-      // Step 3: 少し待つ
+      // Step 3: ファイルがACTIVEになるまで待つ
       setStatus("ファイルを処理中...");
-      console.log("[Step 3] Waiting for processing...");
-      await waitForProcessing();
-      console.log("[Step 3] Done.");
+      console.log("[Step 3] Waiting for file to be active...");
+      await waitForFileActive(apiKey, fileUri);
+      console.log("[Step 3] File is active.");
 
       // Step 4: 文字起こし
       setStatus("Gemini が文字起こし中...");
