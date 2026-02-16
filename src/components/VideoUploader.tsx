@@ -3,6 +3,14 @@
 import { useState, useRef, useCallback } from "react";
 import { GoogleGenAI } from "@google/genai";
 
+const PROMPT =
+  "この音声/動画を文字起こししてください。以下のルールに従ってください：\n" +
+  "- タイムスタンプは不要\n" +
+  "- 話者の区別は不要\n" +
+  "- 「あー」「えー」「まあ」「えっと」などのフィラー（つなぎ言葉）はすべて省いてください\n" +
+  "- 内容を省略せず、すべての発言を書き起こしてください\n" +
+  "- 整った読みやすい文章として出力してください";
+
 export default function VideoUploader() {
   const [file, setFile] = useState<File | null>(null);
   const [transcription, setTranscription] = useState<string>("");
@@ -68,11 +76,12 @@ export default function VideoUploader() {
       const apiKey = await getApiKey();
       console.log("[Step 1] API key obtained.");
 
-      // Step 2: SDK経由でGemini File APIにアップロード
+      const ai = new GoogleGenAI({ apiKey });
+
+      // Step 2: アップロード
       setStatus("ファイルをアップロード中...");
       console.log("[Step 2] Uploading via SDK...");
 
-      const ai = new GoogleGenAI({ apiKey });
       const uploadedFile = await ai.files.upload({
         file: file,
         config: {
@@ -83,48 +92,84 @@ export default function VideoUploader() {
 
       console.log("[Step 2] Upload complete. URI:", uploadedFile.uri, "State:", uploadedFile.state);
 
-      // Step 3: ACTIVEになるまでクライアント側で待つ
+      // Step 3: ACTIVE待ち（状態確認でエラーが出たら無視してリトライ）
       setStatus("ファイルを処理中...");
-      console.log("[Step 3] Waiting for ACTIVE state...");
+      console.log("[Step 3] Waiting for ACTIVE...");
 
-      let fileState = uploadedFile;
-      let attempts = 0;
-      while (fileState.state === "PROCESSING" && attempts < 60) {
-        attempts++;
-        console.log(`[Step 3] State: ${fileState.state}, attempt ${attempts}...`);
-        setStatus(`ファイルを処理中...（${attempts}回目）`);
-        await new Promise((resolve) => setTimeout(resolve, 5000));
-        fileState = await ai.files.get({ name: fileState.name! });
+      const fileUri = uploadedFile.uri!;
+      const mimeType = uploadedFile.mimeType || file.type;
+      let isActive = uploadedFile.state === "ACTIVE";
+
+      if (!isActive) {
+        // 状態確認APIがエラーを返すことがあるので、
+        // 一定時間待ってから直接文字起こしを試みる
+        console.log("[Step 3] File is PROCESSING, waiting 30 seconds...");
+        for (let i = 0; i < 6; i++) {
+          setStatus(`ファイルを処理中...（${(i + 1) * 5}秒）`);
+          await new Promise((resolve) => setTimeout(resolve, 5000));
+        }
+        console.log("[Step 3] Wait complete, proceeding to transcription.");
       }
 
-      if (fileState.state !== "ACTIVE") {
-        throw new Error(`ファイルの処理に失敗しました (state: ${fileState.state})`);
-      }
-
-      console.log("[Step 3] File is ACTIVE!");
-
-      // Step 4: サーバーに文字起こしを依頼
+      // Step 4: 文字起こし（リトライ付き）
       setStatus("Gemini が文字起こし中...");
-      console.log("[Step 4] Requesting transcription...");
+      console.log("[Step 4] Starting transcription...");
 
-      const res = await fetch("/api/transcribe", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          fileUri: fileState.uri,
-          mimeType: fileState.mimeType,
-        }),
-      });
+      let lastError = "";
+      for (let attempt = 0; attempt < 10; attempt++) {
+        try {
+          console.log(`[Step 4] Attempt ${attempt + 1}...`);
+          const response = await ai.models.generateContent({
+            model: "gemini-2.5-flash",
+            contents: [
+              {
+                role: "user",
+                parts: [
+                  {
+                    fileData: {
+                      fileUri: fileUri,
+                      mimeType: mimeType,
+                    },
+                  },
+                  {
+                    text: PROMPT,
+                  },
+                ],
+              },
+            ],
+            config: {
+              maxOutputTokens: 65536,
+              thinkingConfig: {
+                thinkingBudget: 0,
+              },
+            },
+          });
 
-      const data = await res.json();
+          const text = response.text;
+          if (text) {
+            console.log("[Step 4] Transcription complete!");
+            setTranscription(text);
+            setStatus("");
+            return;
+          }
+          throw new Error("文字起こし結果を取得できませんでした。");
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.log(`[Step 4] Error: ${msg}`);
+          lastError = msg;
 
-      if (!res.ok) {
-        throw new Error(data.error || "文字起こしに失敗しました。");
+          // ファイルがまだ処理中ならリトライ
+          if (msg.includes("not in an ACTIVE state") || msg.includes("FAILED_PRECONDITION")) {
+            setStatus(`ファイルを処理中...リトライ ${attempt + 1}/10`);
+            await new Promise((resolve) => setTimeout(resolve, 15000));
+            continue;
+          }
+          // その他のエラーはそのまま投げる
+          throw err;
+        }
       }
 
-      console.log("[Step 4] Transcription complete!");
-      setTranscription(data.transcription);
-      setStatus("");
+      throw new Error(`文字起こしに失敗しました: ${lastError}`);
     } catch (err) {
       console.error("Error:", err);
       setError(
