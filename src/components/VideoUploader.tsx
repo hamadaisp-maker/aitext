@@ -140,12 +140,16 @@ export default function VideoUploader() {
     fileUri: string,
     mimeType: string
   ): Promise<string> {
-    const model = "gemini-2.5-flash";
+    const model = "gemini-2.0-flash";
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 600000); // 10分タイムアウト
 
     const res = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
+      signal: controller.signal,
       body: JSON.stringify({
         contents: [
           {
@@ -167,6 +171,8 @@ export default function VideoUploader() {
         },
       }),
     });
+
+    clearTimeout(timeoutId);
 
     const data = await res.json();
 
