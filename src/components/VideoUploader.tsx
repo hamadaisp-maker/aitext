@@ -117,12 +117,15 @@ export default function VideoUploader() {
     const maxAttempts = 120;
 
     for (let i = 0; i < maxAttempts; i++) {
+      console.log(`[waitForFileActive] attempt ${i + 1}, checking ${fileName}...`);
       const res = await fetch(
         `https://generativelanguage.googleapis.com/v1beta/files/${fileName}?key=${apiKey}`
       );
       const data = await res.json();
+      console.log(`[waitForFileActive] state: ${data.state}`);
 
       if (data.state === "ACTIVE") {
+        console.log("[waitForFileActive] File is ACTIVE!");
         return;
       } else if (data.state === "FAILED") {
         throw new Error("ファイルの処理に失敗しました。");
@@ -197,19 +200,27 @@ export default function VideoUploader() {
     try {
       // Step 1: APIキー取得
       setStatus("認証情報を取得中...");
+      console.log("[Step 1] Getting API key...");
       const apiKey = await getApiKey();
+      console.log("[Step 1] API key obtained.");
 
       // Step 2: Gemini File APIにアップロード
       setStatus("ファイルをアップロード中...");
+      console.log("[Step 2] Uploading to Gemini...");
       const fileUri = await uploadToGemini(apiKey, file);
+      console.log("[Step 2] Upload complete. fileUri:", fileUri);
 
       // Step 3: ファイル処理完了を待つ
       setStatus("ファイルを処理中...");
+      console.log("[Step 3] Waiting for file to be active...");
       await waitForFileActive(apiKey, fileUri);
+      console.log("[Step 3] File is active.");
 
       // Step 4: 文字起こし
       setStatus("Gemini が文字起こし中...");
+      console.log("[Step 4] Starting transcription...");
       const text = await transcribeWithGemini(apiKey, fileUri, file.type);
+      console.log("[Step 4] Transcription complete.");
 
       setTranscription(text);
       setStatus("");
