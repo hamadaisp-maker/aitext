@@ -63,7 +63,6 @@ export default function VideoUploader() {
 
   // Gemini File APIにアップロード
   async function uploadToGemini(apiKey: string, file: File): Promise<string> {
-    // Step 1: Resumable upload を開始
     const startRes = await fetch(
       `https://generativelanguage.googleapis.com/upload/v1beta/files?key=${apiKey}`,
       {
@@ -86,7 +85,6 @@ export default function VideoUploader() {
       throw new Error("アップロードURLの取得に失敗しました。");
     }
 
-    // Step 2: ファイルデータをアップロード
     const arrayBuffer = await file.arrayBuffer();
     const uploadRes = await fetch(uploadUrl, {
       method: "POST",
@@ -108,99 +106,101 @@ export default function VideoUploader() {
     return fileUri;
   }
 
-  // ファイルがACTIVEになるまで待つ
-  async function waitForFileActive(
-    apiKey: string,
-    fileUri: string
-  ): Promise<void> {
-    const fileName = fileUri.split("/").pop();
-    const maxAttempts = 60;
-
-    for (let i = 0; i < maxAttempts; i++) {
-      console.log(`[waitForFileActive] attempt ${i + 1}...`);
-      try {
-        const res = await fetch(
-          `https://generativelanguage.googleapis.com/v1beta/files/${fileName}?key=${apiKey}`
-        );
-
-        if (res.ok) {
-          const data = await res.json();
-          console.log(`[waitForFileActive] state: ${data.state}`);
-
-          if (data.state === "ACTIVE") {
-            console.log("[waitForFileActive] File is ACTIVE!");
-            return;
-          } else if (data.state === "FAILED") {
-            throw new Error("ファイルの処理に失敗しました。");
-          }
-        } else {
-          // 500エラー等はまだ処理中とみなす
-          console.log(`[waitForFileActive] HTTP ${res.status}, still processing...`);
-        }
-      } catch (err) {
-        if (err instanceof Error && err.message === "ファイルの処理に失敗しました。") {
-          throw err;
-        }
-        console.log("[waitForFileActive] Request failed, retrying...");
-      }
-
-      await new Promise((resolve) => setTimeout(resolve, 5000));
-    }
-
-    throw new Error("ファイルの処理がタイムアウトしました。");
-  }
-
-  // Geminiで文字起こし
-  async function transcribeWithGemini(
+  // Geminiで文字起こし（ファイルがまだ処理中ならリトライ）
+  async function transcribeWithRetry(
     apiKey: string,
     fileUri: string,
-    mimeType: string
+    mimeType: string,
+    updateStatus: (s: string) => void
   ): Promise<string> {
     const model = "gemini-2.0-flash";
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+    const maxRetries = 30;
 
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 600000); // 10分タイムアウト
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+      console.log(`[transcribe] attempt ${attempt + 1}...`);
 
-    const res = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      signal: controller.signal,
-      body: JSON.stringify({
-        contents: [
-          {
-            parts: [
+      try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 120000); // 2分タイムアウト
+
+        const res = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          signal: controller.signal,
+          body: JSON.stringify({
+            contents: [
               {
-                fileData: {
-                  mimeType: mimeType,
-                  fileUri: fileUri,
-                },
-              },
-              {
-                text: PROMPT,
+                parts: [
+                  {
+                    fileData: {
+                      mimeType: mimeType,
+                      fileUri: fileUri,
+                    },
+                  },
+                  {
+                    text: PROMPT,
+                  },
+                ],
               },
             ],
-          },
-        ],
-        generationConfig: {
-          maxOutputTokens: 65536,
-        },
-      }),
-    });
+            generationConfig: {
+              maxOutputTokens: 65536,
+            },
+          }),
+        });
 
-    clearTimeout(timeoutId);
+        clearTimeout(timeoutId);
 
-    const data = await res.json();
+        const data = await res.json();
 
-    if (!res.ok) {
-      console.error("Gemini error:", JSON.stringify(data, null, 2));
-      throw new Error(data.error?.message || "文字起こしに失敗しました。");
+        if (res.ok) {
+          const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
+          if (text) {
+            console.log("[transcribe] Success!");
+            return text;
+          }
+          throw new Error("文字起こし結果を取得できませんでした。");
+        }
+
+        // ファイルがまだ処理中の場合はリトライ
+        const errorMessage = data.error?.message || "";
+        console.log(`[transcribe] Error: ${errorMessage}`);
+
+        if (
+          errorMessage.includes("not in an ACTIVE state") ||
+          errorMessage.includes("FAILED_PRECONDITION") ||
+          res.status === 400
+        ) {
+          updateStatus(`ファイルを処理中...（${attempt + 1}回目）`);
+          await new Promise((resolve) => setTimeout(resolve, 10000));
+          continue;
+        }
+
+        // その他のエラーはそのまま投げる
+        throw new Error(errorMessage || "文字起こしに失敗しました。");
+      } catch (err) {
+        if (err instanceof Error) {
+          if (err.name === "AbortError") {
+            console.log("[transcribe] Timeout, retrying...");
+            updateStatus(`タイムアウト、リトライ中...（${attempt + 1}回目）`);
+            continue;
+          }
+          if (
+            err.message.includes("not in an ACTIVE state") ||
+            err.message.includes("FAILED_PRECONDITION")
+          ) {
+            updateStatus(`ファイルを処理中...（${attempt + 1}回目）`);
+            await new Promise((resolve) => setTimeout(resolve, 10000));
+            continue;
+          }
+          throw err;
+        }
+        throw err;
+      }
     }
 
-    return (
-      data.candidates?.[0]?.content?.parts?.[0]?.text ??
-      "文字起こし結果を取得できませんでした。"
-    );
+    throw new Error("文字起こしがタイムアウトしました。もう一度お試しください。");
   }
 
   const handleSubmit = async () => {
@@ -223,17 +223,11 @@ export default function VideoUploader() {
       const fileUri = await uploadToGemini(apiKey, file);
       console.log("[Step 2] Upload complete. fileUri:", fileUri);
 
-      // Step 3: ファイルがACTIVEになるまで待つ
-      setStatus("ファイルを処理中...");
-      console.log("[Step 3] Waiting for file to be active...");
-      await waitForFileActive(apiKey, fileUri);
-      console.log("[Step 3] File is active.");
-
-      // Step 4: 文字起こし
+      // Step 3: 文字起こし（リトライ付き）
       setStatus("Gemini が文字起こし中...");
-      console.log("[Step 4] Starting transcription...");
-      const text = await transcribeWithGemini(apiKey, fileUri, file.type);
-      console.log("[Step 4] Transcription complete.");
+      console.log("[Step 3] Starting transcription with retry...");
+      const text = await transcribeWithRetry(apiKey, fileUri, file.type, setStatus);
+      console.log("[Step 3] Transcription complete.");
 
       setTranscription(text);
       setStatus("");
