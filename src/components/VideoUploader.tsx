@@ -108,33 +108,11 @@ export default function VideoUploader() {
     return fileUri;
   }
 
-  // ファイルがACTIVEになるまで待つ
-  async function waitForFileActive(
-    apiKey: string,
-    fileUri: string
-  ): Promise<void> {
-    const fileName = fileUri.split("/").pop();
-    const maxAttempts = 120;
-
-    for (let i = 0; i < maxAttempts; i++) {
-      console.log(`[waitForFileActive] attempt ${i + 1}, checking ${fileName}...`);
-      const res = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/files/${fileName}?key=${apiKey}`
-      );
-      const data = await res.json();
-      console.log(`[waitForFileActive] state: ${data.state}`);
-
-      if (data.state === "ACTIVE") {
-        console.log("[waitForFileActive] File is ACTIVE!");
-        return;
-      } else if (data.state === "FAILED") {
-        throw new Error("ファイルの処理に失敗しました。");
-      }
-
-      await new Promise((resolve) => setTimeout(resolve, 3000));
-    }
-
-    throw new Error("ファイルの処理がタイムアウトしました。");
+  // アップロード後に少し待つ（Geminiがファイルを処理する時間を確保）
+  async function waitForProcessing(): Promise<void> {
+    console.log("[waitForProcessing] Waiting 5 seconds for file processing...");
+    await new Promise((resolve) => setTimeout(resolve, 5000));
+    console.log("[waitForProcessing] Done waiting.");
   }
 
   // Geminiで文字起こし
@@ -210,11 +188,11 @@ export default function VideoUploader() {
       const fileUri = await uploadToGemini(apiKey, file);
       console.log("[Step 2] Upload complete. fileUri:", fileUri);
 
-      // Step 3: ファイル処理完了を待つ
+      // Step 3: 少し待つ
       setStatus("ファイルを処理中...");
-      console.log("[Step 3] Waiting for file to be active...");
-      await waitForFileActive(apiKey, fileUri);
-      console.log("[Step 3] File is active.");
+      console.log("[Step 3] Waiting for processing...");
+      await waitForProcessing();
+      console.log("[Step 3] Done.");
 
       // Step 4: 文字起こし
       setStatus("Gemini が文字起こし中...");
